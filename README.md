@@ -8,6 +8,20 @@ This library is mainly used for analysis of the produced geometry among other no
 
 
 
+If you are looking for reflective/refractive caustic surface generation in general check out this other repo:
+https://github.com/dylanmsu/fast_caustic_design
+
+The scripts contained in this library contain various notes and concepts on how to turn OT initialized geometry into finalized high contrast/ spatial frequency caustic images into a manufacturable surface. No generalized solution is formed.
+
+The overall boilerplate code in this script in theory could be assembled into a functioning version of a optimization pipeline outlined in the paper below if the following was completed:
+1) The OT initialization geometry needs to be converted into python instead of C++ and integrated into the differentiation pipeline
+2) The differentiable optimization loss function needs to be developed to consistently produce high contrast caustics (Many various loss functions are described in the optimizer script)
+3) Finally for manufacturability a loss function that describes swept surface tool clearance orthogonally along the tool radius as well as in the conical clearance face direction along the spiral or raster (etc.) toolpath direction need to be implemented into the surface generation before OT initialization. 
+
+Paper describing end goal:
+https://dl.acm.org/doi/10.1145/3732284
+
+There are many other more functional implementations of these concepts but hopefully there might be some useful ideas/code in here. 
 
 Example image showing base heightmap before and after filtering for DT surface profile.
 <img width="1554" height="819" alt="image" src="https://github.com/user-attachments/assets/5990fb62-ffaf-463e-87cf-ff7baadf9b62" />
