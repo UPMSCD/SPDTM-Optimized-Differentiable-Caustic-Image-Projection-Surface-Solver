@@ -3,7 +3,7 @@ A Mitsuba based script that solves for Diamond Turning Machining optimized surfa
 
 Download Mitsuba example scenes to run. 
 
-NOTE: This is mainly used for notetaking and library is mostly nonfunctional in terms of the scope. The Optimal transport math initializes geometry mostly correct. 
+NOTE: This is mainly used for notetaking and library is mostly nonfunctional in terms of the scope. The Optimal transport math initializes geometry correctly at a reflected 45deg angle. 
 This library is mainly used for analysis of the produced geometry among other notes but the differentiable optimization has yet to produce any desireable effects beyond the OT geometry.
 
 
