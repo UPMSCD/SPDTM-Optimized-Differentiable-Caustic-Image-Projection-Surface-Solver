@@ -17,7 +17,7 @@ The overall boilerplate code in this script in theory could be assembled into a 
 1) The OT initialization geometry needs to be converted into python instead of C++ and integrated into the differentiation pipeline
 2) The differentiable optimization loss function needs to be developed to consistently produce high contrast caustics (Many various loss functions are described in the optimizer script)
 3) Finally for manufacturability a loss function that describes swept surface tool clearance orthogonally along the tool radius as well as in the conical clearance face direction along the spiral or raster (etc.) toolpath direction need to be implemented into the surface generation before OT initialization.
-4) If you do all that pls message me I would want to mess around with that.
+4) If you do all that pls message me I would want to mess around with the tool. Manufacutring the finalized surface geometry to nanometer form accuracy is more available to me than the time needed to implement the rest of the code :(.
 
 Paper describing end goal:
 https://dl.acm.org/doi/10.1145/3732284
