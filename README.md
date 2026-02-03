@@ -3,6 +3,12 @@ A Mitsuba based script that solves for Diamond Turning Machining optimized surfa
 
 Download Mitsuba example scenes to run. 
 
+NOTE: This is mainly used for notetaking and library is mostly nonfunctional. The Optimal transport math initializes geometry mostly correct. 
+This library is mainly used for analysis of the produced geometry among other notes but the differentiable optimization has yet to produce any desireable effects beyond the OT geometry.
+
+
+
+
 Example image showing base heightmap before and after filtering for DT surface profile.
 <img width="1554" height="819" alt="image" src="https://github.com/user-attachments/assets/5990fb62-ffaf-463e-87cf-ff7baadf9b62" />
 
