@@ -244,6 +244,9 @@ def thresholded_l2_loss(image, ref, epsilon=0.01):
 
 
 
+
+
+
 def generate_spiral_overlay(res_x, res_y, revolutions=50):
     """
     Generates a boolean mask of a spiral toolpath.
@@ -292,6 +295,194 @@ def generate_spiral_overlay(res_x, res_y, revolutions=50):
 
 
 
+###OT initialization
+
+
+from scipy.interpolate import griddata
+
+def load_ot_as_heightmap(obj_file, resolution):
+    """
+    Extracts the top surface from the OT OBJ, resamples it to a grid,
+    and returns a Mitsuba-ready Tensor.
+    """
+    vertices = []
+    with open(obj_file, 'r') as f:
+        for line in f:
+            if line.startswith('v '):
+                parts = line.split()
+                vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    
+    points = np.array(vertices)
+    
+    # 1. Extract Top Surface (Your existing logic)
+    surface_map = {}
+    for p in points:
+        key = (round(p[0], 3), round(p[1], 3))
+        if key not in surface_map or p[2] > surface_map[key][2]:
+            surface_map[key] = p
+    mirror_points = np.array(list(surface_map.values()))
+
+    # 2. Create Target Grid (Mitsuba uses UV space 0 to 1, or -1 to 1)
+    # We match the bounds of the mirror_points to a regular grid
+    grid_x, grid_y = np.mgrid[
+        np.min(mirror_points[:,0]):np.max(mirror_points[:,0]):complex(resolution[0]),
+        np.min(mirror_points[:,1]):np.max(mirror_points[:,1]):complex(resolution[1])
+    ]
+
+    # 3. Interpolate heights (Z) onto the grid
+    # This handles any missing points or non-uniformity in the OBJ
+    grid_z = griddata(mirror_points[:, :2], mirror_points[:, 2], (grid_x, grid_y), method='cubic')
+    
+    # Fill NaNs if the interpolation goes outside the convex hull
+    grid_z = np.nan_to_num(grid_z, nan=np.min(mirror_points[:, 2]))
+
+    # 4. Convert to Mitsuba Tensor
+    # Note: We need to flip or transpose depending on how UVs are mapped
+    return mi.TensorXf(grid_z.astype(np.float32))
+
+
+
+
+def energy_stable_concentration_loss(image, ref_image, energy_weight=100.0):
+    # 1. Calculate Total Energy (Flux)
+    # This is the sum of all light currently hitting the sensor
+    current_energy = dr.sum(image)
+    
+    # 2. Calculate Reference Energy
+    # This is how much light we SHOULD have if all rays hit the sensor
+    target_energy = dr.sum(ref_image)
+    
+    # 3. The "Stay On Screen" Penalty (The Anchor)
+    # If current_energy < target_energy, this value grows quadratically.
+    # We use dr.maximum to only punish LOSING light, not gaining it.
+    energy_loss = dr.sqr(dr.maximum(0.0, target_energy - current_energy))
+    
+    # 4. The Concentration Reward (The Sharpness)
+    # We use a normalized L2 norm. 
+    # Normalizing by (sum^2) ensures that the optimizer doesn't just
+    # try to make the image brighter to win; it must make it SHARPER.
+    concentration = dr.sum(dr.sqr(image)) / (dr.sqr(current_energy) + 1e-6)
+    
+    # Total Loss:
+    # We minimize this. A high energy_weight ensures the light STAYS on the sensor.
+    return (energy_weight * energy_loss) - concentration
+
+
+
+
+
+
+
+
+
+
+def gaussian_blur_2d(tensor, sigma):
+    """
+    Improved Gaussian blur for Mitsuba/Dr.Jit tensors.
+    Handles signed/unsigned coordinate math correctly for CUDA.
+    """
+    if sigma <= 0:
+        return tensor
+
+    # 1. Prepare Metadata
+    shape = tensor.shape # (H, W, C)
+    h, w, channels = shape
+    
+    # Flatten the tensor into a Dr.Jit array for efficient gathering
+    # If C=3, this becomes an array of Color3f or Vector3f
+    flat_data = dr.ravel(tensor)
+    if channels == 3:
+        data_to_blur = mi.Color3f(flat_data)
+    else:
+        data_to_blur = mi.Float(flat_data)
+
+    # 2. Prepare Kernel
+    radius = int(3 * sigma + 0.5)
+    x = np.linspace(-radius, radius, 2 * radius + 1)
+    kernel_np = np.exp(-0.5 * (x / sigma)**2)
+    kernel_np /= np.sum(kernel_np)
+    kernel = mi.Float(kernel_np)
+
+    # 3. Prepare Coordinates (as Signed Int for math)
+    y_idx = dr.arange(mi.Int, h)
+    x_idx = dr.arange(mi.Int, w)
+    grid_y, grid_x = dr.meshgrid(y_idx, x_idx, indexing='ij')
+
+    def convolve(data, is_horizontal):
+        # Initialize output with the same type as input (e.g., Color3f)
+        output = dr.zeros(type(data), h * w)
+        
+        for i in range(len(kernel_np)):
+            # Explicitly cast offset to mi.Int to avoid promotion errors
+            offset = mi.Int(i - radius)
+            
+            if is_horizontal:
+                sampled_x = dr.clamp(grid_x + offset, 0, w - 1)
+                # Convert back to UInt for indexing
+                indices = mi.UInt(grid_y * w + sampled_x)
+            else:
+                sampled_y = dr.clamp(grid_y + offset, 0, h - 1)
+                indices = mi.UInt(sampled_y * w + grid_x)
+            
+            output += dr.gather(type(data), data, indices) * kernel[i]
+        return output
+
+    # 4. Perform Separable Convolution
+    # Pass 1: Horizontal
+    tmp = convolve(data_to_blur, is_horizontal=True)
+    # Pass 2: Vertical
+    final_flat = convolve(tmp, is_horizontal=False)
+
+    # 5. Reshape back to Tensor
+    return mi.TensorXf(dr.ravel(final_flat), shape=shape)
+
+
+def robust_stray_light_loss(image, ref, epsilon=1e-3):
+    # Log-space loss flattens the peaks and boosts the importance of dim stray light
+    loss = dr.log(dr.sqr(image - ref) + epsilon)
+    return dr.mean(loss)
+
+
+
+
+def background_uniformity_loss(image, background_mask):
+    # Isolate only the stray light in the background regions
+    stray_light = image * background_mask
+    
+    # Penalize any brightness in these areas
+    # Squaring the values makes the gradient steeper for brighter stray spots
+    return dr.mean(dr.sqr(stray_light))
+
+
+def background_median_loss(image, background_mask):
+    stray_light = image * background_mask
+    
+    # L1 Loss (Absolute Difference) is great for 'median-like' behavior
+    # It applies a constant pressure to every non-black pixel
+    return dr.mean(dr.abs(stray_light))
+
+
+
+
+
+
+
+
+
+
+def focus_aware_loss(image, ref, focus_weight=0.1):
+    # 1. Standard L2 Match (keeps the shape in the right spot)
+    # Use a slight blur so the optimizer has a "path" to follow
+    dist_loss = dr.sum(dr.sqr(image - ref))
+
+    # 2. Focus Penalty (Sharpness)
+    # A focused caustic has very high intensity in small areas.
+    # By maximizing the SQR of the pixels, we reward "peaks" 
+    # and punish "gray blur". We subtract this because we want to minimize loss.
+    sharpness_bonus = dr.sum(dr.sqr(image)) 
+
+    # Total Loss = (Stay near the target) - (Be as sharp as possible)
+    return dist_loss - (focus_weight * sharpness_bonus)
 
 
 

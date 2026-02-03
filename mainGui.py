@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import math
 from scipy.interpolate import RectBivariateSpline
 from scipy.ndimage import gaussian_filter, median_filter
-from matplotlib.widgets import Slider, Button
+
 
 from scipy.ndimage import gaussian_filter, median_filter
 
@@ -20,9 +20,8 @@ from scipy.ndimage import gaussian_filter, median_filter
 mi.set_variant('cuda_ad_rgb', 'llvm_ad_rgb')
 
 
-
 #initialize startup config for file location and image
-config_name = 'Star3'
+config_name = 'star3'
 initialConfig = startupConfig.create(config_name)
 config = initialConfig.config
 SCENE_DIR = initialConfig.SCENE_DIR
@@ -71,12 +70,11 @@ cameraFov=20
 
 
 lap_loss_scale = 0
-tv_loss_scale = 0
+tv_loss_scale = 0.001
 slope_loss_scale = 0
 crash_loss_scale = 1
 stray_light_loss_scale = 0
 background_loss_scale = 0
-error_history_loss_scale = 0
 
 clear_aperture=10.0    
 clearanceAngle=7     
@@ -87,7 +85,7 @@ load_obj_as_mesh = True
 skip_upsampling = False
 load_ply_as_mesh = False
 align_mesh_to_ref = False
-save_smoothed = True
+save_smoothed = False
 heightmap_smooth_kick = False
 
 ###########
@@ -146,21 +144,6 @@ if config['emitter'] == 'gray':
         'radiance': {
             'type': 'spectrum',
             'value': 0.8
-        },
-    }
-if config['emitter'] == 'bayer':
-    bayer = dr.zeros(mi.TensorXf, (32, 32, 3))
-    bayer[ ::2,  ::2, 2] = 2.2
-    bayer[ ::2, 1::2, 1] = 2.2
-    bayer[1::2, 1::2, 0] = 2.2
-
-    emitter = {
-        'type':'directionalarea',
-        'radiance': {
-            'type': 'bitmap',
-            'bitmap': mi.Bitmap(bayer),
-            'raw': True,
-            'filter_type': 'nearest'
         },
     }
 
@@ -620,91 +603,40 @@ if(align_mesh_to_ref):
 
 
 
-def save_smoothed_nurbs_mesh(output_path, opt_tensor, resolution):
+def save_smoothed_nurbs_mesh(output_path, s=0.01):
     """
     Fits a spline over the optimizer data, updates the texture, 
     applies displacement, and saves.
     """
-    # 1. Prepare Data
-    h_map = dr.reshape(mi.TensorXf, opt_tensor, (resolution[0], resolution[1]))
+    print(f"[i] Fitting Spline to Texture Data (s={s})...")
+
+    # 1. Get current resolution from the optimizer tensor
+    # shape is likely (H, W, 1)
+    current_h, current_w, _ = dr.shape(opt['data'])
+    
+    # 2. Reshape and convert to NumPy for Scipy
+    # We use opt['data'] as it contains the current trained heightmap
+    h_map = dr.reshape(mi.TensorXf, opt['data'], (current_h, current_w))
     h_np = np.array(h_map)
-    h_base = median_filter(h_np, size=3)
     
-    x_coords = np.linspace(0, 1, resolution[0])
-    z_coords = np.linspace(0, 1, resolution[1])
-    mid = resolution[0] // 2
+    # 3. Fit the Bivariate Spline
+    x = np.linspace(0, 1, current_h)
+    z = np.linspace(0, 1, current_w)
+    spline = RectBivariateSpline(x, z, h_np, kx=3, ky=3, s=s)
     
-    # Internal state
-    state = {'sigma': 1.0, 'data': h_np}
+    # 4. Evaluate and convert back to Dr.Jit
+    smoothed_h_np = spline(x, z).astype(np.float32)
+    # Ensure it matches the (H, W, 1) shape the optimizer/texture expects
+    smoothed_h_tensor = mi.TensorXf(smoothed_h_np.reshape(current_h, current_w, 1))
 
-    # 2. Setup Plot
-    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-    plt.subplots_adjust(top=0.85)
-
-    def redraw():
-        # Apply filter and spline
-        filtered = gaussian_filter(h_base, sigma=state['sigma'])
-        spline = RectBivariateSpline(x_coords, z_coords, filtered, kx=3, ky=3, s=0)
-        state['data'] = spline(x_coords, z_coords)
-        
-        # Update Plots
-        axs[0].clear()
-        axs[0].plot(h_np[mid, :], alpha=0.3, color='gray', label='Raw')
-        axs[0].plot(state['data'][mid, :], color='red', lw=2, label='Smoothed')
-        axs[0].set_title(f"Profile (Sigma: {state['sigma']:.2f})")
-        axs[0].legend()
-        
-        axs[1].clear()
-        axs[1].imshow(state['data'], cmap='magma')
-        axs[1].set_title("Surface Preview")
-        
-        plt.suptitle("ARROWS: Adjust Sigma | ENTER: Confirm & Continue")
-        fig.canvas.draw_idle()
-
-    # 3. Key Press Event Handler
-    def on_key(event):
-        if event.key == 'up':
-            state['sigma'] += 0.1
-            redraw()
-        elif event.key == 'down':
-            state['sigma'] = max(0, state['sigma'] - 0.1)
-            redraw()
-        elif event.key == 'right':
-            state['sigma'] += 0.5
-            redraw()
-        elif event.key == 'left':
-            state['sigma'] = max(0, state['sigma'] - 0.5)
-            redraw()
-        elif event.key == 'enter':
-            plt.close(fig)
-
-    fig.canvas.mpl_connect('key_press_event', on_key)
+    # 5. TEMPORARILY overwrite the texture data
+    # We detach to ensure we aren't trying to record gradients for a save operation
+    opt['data'] = dr.detach(smoothed_h_tensor)
     
-    # 4. Initial Draw
-    redraw()
-
-    # 5. THE "OLD SCHOOL" BLOCKING LOOP
-    # This works in almost every IDE environment
-    plt.show(block=False) 
-    while plt.fignum_exists(fig.number):
-        plt.pause(0.1) # This keeps the window alive and responsive
-
-    # 6. Return to Optimizer
-    final_h = state['data'].reshape(resolution[0], resolution[1], 1)
-    smoothed_tensor = dr.detach(mi.TensorXf(final_h))
-    
-
-    params['data'] = smoothed_tensor 
-    opt['data'] = smoothed_tensor # Optional: keeps optimizer in sync
-
-
     # 6. Run your existing displacement logic
     # This now uses the smoothed texture data
-    apply_displacement() 
+    apply_displacement(amplitude=1.0) 
     
-    dr.eval(params_scene['lens.vertex_positions'])
-
-
     # 7. Write the PLY
     lens_mesh = [m for m in scene.shapes() if m.id() == 'lens'][0]
     lens_mesh.write_ply(output_path)
@@ -712,74 +644,88 @@ def save_smoothed_nurbs_mesh(output_path, opt_tensor, resolution):
     print(f'[+] Saved NURBS-smoothed lens to: {os.path.basename(output_path)}')
 
 
-def interactive_surface_cleaner(opt_tensor, resolution):
+
+    # Calculate the difference
+
+    mid_row = current_h // 2
+    plt.plot(h_np[mid_row, :], label='Raw Optimized', alpha=0.5)
+    plt.plot(smoothed_h_np[mid_row, :], label='NURBS Smoothed', linewidth=2)
+    plt.legend()
+    plt.title("Surface Cross-Section (Row Slice)")
+    plt.ylabel("Height (mm)")
+    plt.show()
+    plt.pause(0.05)
+    wait = input("enter?")
+
+
+
+def interactive_surface_cleaner(opt_tensor, resolution, sigma=1.0, s_val=0):
+    """
+    Shows a comparison of the heightmap before and after smoothing.
+    Closes the plot to accept changes and continue optimization.
+    """
     # 1. Prepare Data
     h_map = dr.reshape(mi.TensorXf, opt_tensor, (resolution[0], resolution[1]))
     h_np = np.array(h_map)
-    h_base = median_filter(h_np, size=3)
     
-    x_coords = np.linspace(0, 1, resolution[0])
-    z_coords = np.linspace(0, 1, resolution[1])
+    # 2. Apply the High-Frequency Filter (Pre-filter)
+    # Median kills spikes, Gaussian smooths the rest
+    h_clean = median_filter(h_np, size=3)
+    h_clean = gaussian_filter(h_clean, sigma=sigma)
+    
+    # 3. Fit the Spline to the clean data
+    x = np.linspace(0, 1, resolution[0])
+    z = np.linspace(0, 1, resolution[1])
+    spline = RectBivariateSpline(x, z, h_clean, kx=3, ky=3, s=s_val)
+    h_smoothed = spline(x, z)
+
+    # 4. Visualization
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Plot A: Raw Data
+    im0 = axs[0].imshow(h_np, cmap='magma')
+    axs[0].set_title("Raw (Noisy) Optimizer Data")
+    fig.colorbar(im0, ax=axs[0])
+
+    # Plot B: Smoothed Surface
+    im1 = axs[1].imshow(h_smoothed, cmap='magma')
+    axs[1].set_title(f"Smoothed (Sigma={sigma}, s={s_val})")
+    fig.colorbar(im1, ax=axs[1])
+
+    # Plot C: Cross-section comparison
     mid = resolution[0] // 2
-    
-    # Internal state
-    state = {'sigma': 1.0, 'data': h_np}
+    axs[2].plot(h_np[mid, :], label='Raw', alpha=0.4, color='gray')
+    axs[2].plot(h_smoothed[mid, :], label='Smoothed', color='red', linewidth=2)
+    axs[2].set_title("Profile Check (Middle Row)")
+    axs[2].legend()
+    axs[2].grid(True, alpha=0.3)
 
-    # 2. Setup Plot
-    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-    plt.subplots_adjust(top=0.85)
+    plt.suptitle("Check your surface: Close window to ACCEPT and CONTINUE optimization")
+    plt.show() # The script will pause here until you close the window
 
-    def redraw():
-        # Apply filter and spline
-        filtered = gaussian_filter(h_base, sigma=state['sigma'])
-        spline = RectBivariateSpline(x_coords, z_coords, filtered, kx=3, ky=3, s=0)
-        state['data'] = spline(x_coords, z_coords)
-        
-        # Update Plots
-        axs[0].clear()
-        axs[0].plot(h_np[mid, :], alpha=0.3, color='gray', label='Raw')
-        axs[0].plot(state['data'][mid, :], color='red', lw=2, label='Smoothed')
-        axs[0].set_title(f"Profile (Sigma: {state['sigma']:.2f})")
-        axs[0].legend()
-        
-        axs[1].clear()
-        axs[1].imshow(state['data'], cmap='magma')
-        axs[1].set_title("Surface Preview")
-        
-        plt.suptitle("ARROWS: Adjust Sigma | ENTER: Confirm & Continue")
-        fig.canvas.draw_idle()
+    # 5. Return the data to the optimizer format
+    # Reshape back to (H, W, 1)
+    new_data = h_smoothed.reshape(resolution[0], resolution[1], 1)
+    return dr.detach(mi.TensorXf(new_data))
 
-    # 3. Key Press Event Handler
-    def on_key(event):
-        if event.key == 'up':
-            state['sigma'] += 0.1
-            redraw()
-        elif event.key == 'down':
-            state['sigma'] = max(0, state['sigma'] - 0.1)
-            redraw()
-        elif event.key == 'right':
-            state['sigma'] += 0.5
-            redraw()
-        elif event.key == 'left':
-            state['sigma'] = max(0, state['sigma'] - 0.5)
-            redraw()
-        elif event.key == 'enter':
-            plt.close(fig)
 
-    fig.canvas.mpl_connect('key_press_event', on_key)
-    
-    # 4. Initial Draw
-    redraw()
 
-    # 5. THE "OLD SCHOOL" BLOCKING LOOP
-    # This works in almost every IDE environment
-    plt.show(block=False) 
-    while plt.fignum_exists(fig.number):
-        plt.pause(0.1) # This keeps the window alive and responsive
+# --- HOW TO USE IN YOUR LOOP ---
+# Every 100 iterations, or when you trigger 'kick'
+#if it % 100 == 0:
+#    opt['data'] = interactive_surface_cleaner(opt['data'], resolution, sigma=1.2)
+#    # Re-apply to the mesh so the next render uses the smooth version
+#    apply_displacement()
 
-    # 6. Return to Optimizer
-    final_h = state['data'].reshape(resolution[0], resolution[1], 1)
-    return dr.detach(mi.TensorXf(final_h))
+
+
+
+
+
+
+
+
+
 
 
 
@@ -972,11 +918,10 @@ for it in range(iterations):
         + stray_light_loss_scale * stray_light_loss \
         + background_loss_scale * background_loss \
         + background_loss_scale * bg_uniformity_loss \
-        + error_history_loss_scale * error_history[-1] \
+        + 0 * error_history[-1] \
         #+ crash_loss_scale * crash_loss
         #+ slope_loss_scale * slope_loss
             # Back-propagate errors to input parameters and take an optimizer step
-
     dr.backward(loss)
     print(" " + str(loss))
     print("  bgm" + str(background_loss))    # 2. SMOOTH THE GRADIENTS (Add this)
@@ -1003,14 +948,10 @@ for it in range(iterations):
             opt['data'] = dr.upsample(opt['data'], scale_factor=(2, 2, 1))
     else:
         if it in upsampling_steps: # Increase resolution of the heightmap###########
-            current_h, current_w, depth = dr.shape(opt['data']) # e.g., 512, 512
-            # and resume only when you hit ENTER.
-            #opt['data'] = interactive_surface_cleaner(opt['data'], (current_h, current_w))   #this applies the NURBS smoothing during optimization
 
             opt['data'] = dr.upsample(opt['data'], scale_factor=(2, 2, 1))
             #opt.set_learning_rate(2 * opt.learning_rate())
             #print(f"Increased learning rate to: {opt.learning_rate()}")
-
 
 
     # Carry over the update to our "latent variable" (the heightmap values)
@@ -1045,23 +986,10 @@ for it in range(iterations):
         error_history[0] = error_history[2]
         error_history[1] = error_history[2]
 
-        # Visualize every 10 steps
-    if it % 10 == 0 or it == (iterations - 1):
-        update_visualization(
-            it=it,
-            current_img=dr.detach(image),           # Detach from graph
-            current_heightmap=dr.detach(params['data']), # Detach from graph
-            reference_image=image_ref,
-            error_history=error_history,
-            cbar=False,
-            aperture_mm=clear_aperture,    
-            tool_deg=clearanceAngle,       # Safety margin (use slightly less than 12)
-            tool_rad_mm=toolRadius      
-        )
 
 
 # ... inside your optimization loop ...
-    if (it % 50 == 0):
+    if (it % 50 == 0 and it > 0):
         save = input("Save Y/N?")
         if(save == 'Y'):
                 fname = join(output_dir, 'lens_displaced.ply')
@@ -1072,7 +1000,8 @@ for it in range(iterations):
 
                 if(save_smoothed):
                     current_h, current_w, depth = dr.shape(opt['data'])
-                    save_smoothed_nurbs_mesh(fname, opt['data'], (current_h, current_w))
+                    
+                    save_smoothed_nurbs_mesh(fname)
                     print("saveSMooth")
 
         if(save == "kick"):
@@ -1096,12 +1025,13 @@ for it in range(iterations):
         if(save == "NURBS"):
             heightmap_smooth_kick = True
             itKick = it
-        if (save == "SMOOTH"):
+        if(save == "SMOOTH"):
             current_h, current_w, depth = dr.shape(opt['data']) # e.g., 512, 512
-            # and resume only when you hit ENTER.
-            opt['data'] = interactive_surface_cleaner(opt['data'], (current_h, current_w))
-
-
+            check = 0.0000000000001
+            beforeFilter = opt['data']
+            while(check >= 0):
+                opt['data'] = interactive_surface_cleaner(beforeFilter, (current_h, current_w), sigma=check)
+                check = float(input("Enter nurbs Sigma: "))
 
 
     if (it - itKick > 10 and heightmap_smooth_kick):
@@ -1115,6 +1045,19 @@ for it in range(iterations):
 
 
 
+        # Visualize every 10 steps
+    if it % 10 == 0 or it == (iterations - 1):
+        update_visualization(
+            it=it,
+            current_img=dr.detach(image),           # Detach from graph
+            current_heightmap=dr.detach(params['data']), # Detach from graph
+            reference_image=image_ref,
+            error_history=error_history,
+            cbar=False,
+            aperture_mm=clear_aperture,    
+            tool_deg=clearanceAngle,       # Safety margin (use slightly less than 12)
+            tool_rad_mm=toolRadius      
+        )
 
 
 save = input("Save surface Y/N?")
@@ -1136,8 +1079,7 @@ if(save == 'Y'):
     print('[+] Saved displaced lens to:', os.path.basename(fname))
 
     if(save_smoothed):
-        current_h, current_w, depth = dr.shape(opt['data'])
-        save_smoothed_nurbs_mesh(fname, opt['data'], (current_h, current_w))
+        save_smoothed_nurbs_mesh(fname)
         print("saveSMooth")
 
 
